@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Native host for the system Widevine CDM (libwidevinecdm.so) via its official cdm::ContentDecryptionModule interface — generate license challenges and decrypt CENC, no key extraction."
 license = "MIT"
-repository = "https://github.com/kopuz-org/cdm-host"
+repository = "https://github.com/Kopuz-org/cdm-host"
 keywords = ["widevine", "cdm", "drm", "cenc", "decrypt"]
 categories = ["multimedia", "api-bindings"]
 
