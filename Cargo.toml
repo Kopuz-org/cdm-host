@@ -15,9 +15,20 @@ path = "src/lib.rs"
 name = "cdm_challenge"
 path = "src/main.rs"
 
+[features]
+default = []
+# Fetch the CDM from Google's Chrome package when none is found locally.
+download = ["dep:ureq", "dep:lzma-rs", "dep:ruzstd", "dep:tar"]
+
 [build-dependencies]
 cc = "1"
 
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+
+# Optional, only for the `download` fallback in `vendor` (pure-Rust extraction).
+ureq = { version = "2", optional = true }
+lzma-rs = { version = "0.3", optional = true }
+ruzstd = { version = "0.7", optional = true }
+tar = { version = "0.4", optional = true }
