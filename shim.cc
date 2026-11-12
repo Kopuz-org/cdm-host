@@ -56,6 +56,10 @@ class Host : public Host_11 {
   bool rejected = false;
   std::string error;
   bool keys_changed = false;
+  bool keys_usable = false;
+  // The last non-usable status reported, valid when has_key_status is set.
+  bool has_key_status = false;
+  KeyStatus key_status = kUsable;
   bool resolved = false;
   std::vector<std::pair<int64_t, void*>> timers;
 
@@ -85,8 +89,17 @@ class Host : public Host_11 {
     got_message = true; challenge.assign(reinterpret_cast<const uint8_t*>(msg),
                                          reinterpret_cast<const uint8_t*>(msg) + n);
   }
-  void OnSessionKeysChange(const char*, uint32_t, bool, const KeyInformation*, uint32_t) override {
+  void OnSessionKeysChange(const char*, uint32_t, bool, const KeyInformation* keys,
+                           uint32_t n) override {
     keys_changed = true;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (keys[i].status == kUsable) {
+        keys_usable = true;
+      } else {
+        has_key_status = true;
+        key_status = keys[i].status;
+      }
+    }
   }
   void OnExpirationChange(const char*, uint32_t, Time) override {}
   void OnSessionClosed(const char*, uint32_t) override {}
@@ -176,15 +189,19 @@ int ch_challenge(const uint8_t* init_data, uint32_t len, uint8_t** out, uint32_t
   return 0;
 }
 
-// Feed the license response back into the CDM.
+// Feed the license response back into the CDM. 0 only once a key is kUsable;
+// a key change that leaves none usable returns 50 + its KeyStatus.
 int ch_update(const uint8_t* license, uint32_t len) {
   if (!g_host || !g_host->cdm) return 20;
-  g_host->keys_changed = false; g_host->rejected = false;
+  g_host->keys_changed = false; g_host->keys_usable = false;
+  g_host->has_key_status = false; g_host->rejected = false;
   g_host->cdm->UpdateSession(2, g_host->session_id.c_str(),
                              static_cast<uint32_t>(g_host->session_id.size()), license, len);
-  for (int i = 0; i < 500 && !g_host->keys_changed && !g_host->rejected; ++i) g_host->fire_timers();
+  for (int i = 0; i < 500 && !g_host->keys_usable && !g_host->rejected; ++i) g_host->fire_timers();
   if (g_host->rejected) return 21;
-  return g_host->keys_changed ? 0 : 22;
+  if (g_host->keys_usable) return 0;
+  if (g_host->has_key_status) return 50 + static_cast<int>(g_host->key_status);
+  return 22;
 }
 
 // Decrypt one CENC buffer (single-key, key_id from the pssh). Returns cleartext.

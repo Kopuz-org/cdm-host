@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod error;
 pub mod vendor;
 
-pub use error::{DecryptStatus, Error, Result};
+pub use error::{DecryptStatus, Error, KeyStatus, Result};
 
 extern "C" {
     fn ch_open(so_path: *const c_char) -> c_int;
@@ -126,6 +126,8 @@ impl CdmHost {
     }
 
     /// Feed the license response back into the CDM (so it learns the content keys).
+    /// Succeeds only once at least one key is usable; otherwise the error names
+    /// the status the CDM reported.
     pub fn update(&self, license: &[u8]) -> Result<()> {
         match unsafe { ch_update(license.as_ptr(), license.len() as u32) } {
             0 => Ok(()),

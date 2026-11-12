@@ -31,6 +31,8 @@ pub enum Error {
     NoChallenge,
     #[error("the license did not change any keys")]
     NoKeyChange,
+    #[error("the license left no key usable (last status: {0})")]
+    KeyNotUsable(KeyStatus),
     #[error("CDM decrypt failed: {0}")]
     Decrypt(DecryptStatus),
     #[error("the CDM returned no decrypted buffer")]
@@ -98,9 +100,13 @@ impl Error {
             20 => Error::NotOpen,
             21 => Error::Rejected,
             22 => Error::NoKeyChange,
-            code => Error::Unknown {
-                call: "ch_update",
-                code,
+            // 50 + cdm::KeyStatus for a key change with no usable key.
+            code => match code.checked_sub(50).and_then(KeyStatus::from_raw) {
+                Some(status) => Error::KeyNotUsable(status),
+                None => Error::Unknown {
+                    call: "ch_update",
+                    code,
+                },
             },
         }
     }
@@ -160,6 +166,45 @@ impl fmt::Display for DecryptStatus {
     }
 }
 
+/// A non-usable `cdm::KeyStatus` the CDM reported for a license's keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyStatus {
+    InternalError,
+    Expired,
+    OutputRestricted,
+    OutputDownscaled,
+    StatusPending,
+    Released,
+}
+
+impl KeyStatus {
+    fn from_raw(status: c_int) -> Option<Self> {
+        Some(match status {
+            1 => Self::InternalError,
+            2 => Self::Expired,
+            3 => Self::OutputRestricted,
+            4 => Self::OutputDownscaled,
+            5 => Self::StatusPending,
+            6 => Self::Released,
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for KeyStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InternalError => "internal error",
+            Self::Expired => "expired",
+            Self::OutputRestricted => "output restricted",
+            Self::OutputDownscaled => "output downscaled",
+            Self::StatusPending => "status pending",
+            Self::Released => "released",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +224,17 @@ mod tests {
                 code: 31
             }
         ));
+    }
+
+    #[test]
+    fn update_codes_map_to_key_status() {
+        assert!(matches!(
+            Error::from_update(53),
+            Error::KeyNotUsable(KeyStatus::OutputRestricted)
+        ));
+        assert!(matches!(Error::from_update(22), Error::NoKeyChange));
+        // 50 + kUsable is success, never an error code.
+        assert!(matches!(Error::from_update(50), Error::Unknown { .. }));
     }
 
     #[test]
