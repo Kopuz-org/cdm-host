@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 const SO_NAME: &str = "libwidevinecdm.so";
 
 /// Ensure `dir/libwidevinecdm.so` exists and return its path, installing one if
-/// the directory doesn't already have it.
+/// the directory doesn't already have it. A leading `~` in `dir` is expanded to
+/// `$HOME`.
 pub fn ensure(dir: &Path) -> anyhow::Result<PathBuf> {
+    let dir = &expand_tilde(dir);
     let target = dir.join(SO_NAME);
     if target.exists() {
         return Ok(target);
@@ -38,6 +40,24 @@ pub fn ensure(dir: &Path) -> anyhow::Result<PathBuf> {
         "no Widevine CDM found on the system and the `download` feature is off — \
          install Chrome/Brave/Chromium, point at a CDM with $WIDEVINE_CDM, or enable `download`"
     ))
+}
+
+/// Expand a leading `~` (alone or as `~/...`) to `$HOME`. `~user` forms and
+/// paths without a leading tilde are returned unchanged, as is everything when
+/// `$HOME` is unset.
+fn expand_tilde(path: &Path) -> PathBuf {
+    expand_tilde_with(path, std::env::var_os("HOME").map(PathBuf::from))
+}
+
+fn expand_tilde_with(path: &Path, home: Option<PathBuf>) -> PathBuf {
+    let Some(home) = home else {
+        return path.to_path_buf();
+    };
+    match path.strip_prefix("~") {
+        Ok(rest) if rest.as_os_str().is_empty() => home,
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// Find an existing `libwidevinecdm.so` from a Chromium-family install. Honours
@@ -69,7 +89,10 @@ pub fn locate_system_cdm() -> Option<PathBuf> {
 /// Within a `WidevineCdm` root (holding `<version>/_platform_specific/...`
 /// subdirs), return the `.so` from the highest version present.
 fn newest_in_root(root: &Path) -> Option<PathBuf> {
-    let mut versions: Vec<PathBuf> = std::fs::read_dir(root).ok()?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    let mut versions: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
     versions.sort();
     versions.into_iter().rev().find_map(|v| {
         let so = v.join("_platform_specific/linux_x64").join(SO_NAME);
@@ -88,7 +111,10 @@ fn download_into(target: &Path) -> anyhow::Result<()> {
     // Fetch the .deb fully into memory (one-time, ~130 MB).
     let mut deb = Vec::new();
     std::io::Read::read_to_end(
-        &mut ureq::get(DEB_URL).call().map_err(|e| anyhow::anyhow!("download chrome: {e}"))?.into_reader(),
+        &mut ureq::get(DEB_URL)
+            .call()
+            .map_err(|e| anyhow::anyhow!("download chrome: {e}"))?
+            .into_reader(),
         &mut deb,
     )
     .map_err(|e| anyhow::anyhow!("read chrome .deb: {e}"))?;
@@ -100,7 +126,10 @@ fn download_into(target: &Path) -> anyhow::Result<()> {
 
     // Find WidevineCdm/.../linux_x64/libwidevinecdm.so inside the tarball.
     let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
-    for entry in archive.entries().map_err(|e| anyhow::anyhow!("read data.tar: {e}"))? {
+    for entry in archive
+        .entries()
+        .map_err(|e| anyhow::anyhow!("read data.tar: {e}"))?
+    {
         let mut entry = entry.map_err(|e| anyhow::anyhow!("tar entry: {e}"))?;
         let path = entry.path().map_err(|e| anyhow::anyhow!("tar path: {e}"))?;
         let p = path.to_string_lossy();
@@ -122,7 +151,11 @@ fn ar_member<'a>(ar: &'a [u8], prefix: &str) -> Option<&'a [u8]> {
     while off + 60 <= body.len() {
         let header = &body[off..off + 60];
         let name = std::str::from_utf8(&header[0..16]).ok()?.trim_end();
-        let size: usize = std::str::from_utf8(&header[48..58]).ok()?.trim_end().parse().ok()?;
+        let size: usize = std::str::from_utf8(&header[48..58])
+            .ok()?
+            .trim_end()
+            .parse()
+            .ok()?;
         let start = off + 60;
         let end = start + size;
         if end > body.len() {
@@ -151,7 +184,10 @@ fn decompress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
             std::io::Read::read_to_end(&mut dec, &mut out)
                 .map_err(|e| anyhow::anyhow!("zstd decompress: {e}"))?;
         }
-        _ => anyhow::bail!("unsupported data.tar compression (magic {:02x?})", &data[..data.len().min(4)]),
+        _ => anyhow::bail!(
+            "unsupported data.tar compression (magic {:02x?})",
+            &data[..data.len().min(4)]
+        ),
     }
     Ok(out)
 }
