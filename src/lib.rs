@@ -11,6 +11,7 @@
 //!   `download` feature — fetching it from Google), then open it.
 
 use std::ffi::CString;
+use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
 use std::path::Path;
 
@@ -46,8 +47,13 @@ unsafe fn take(out: *mut u8, len: u32) -> Vec<u8> {
 /// The underlying native CDM is a single global instance, so every `CdmHost`
 /// drives the same CDM; opening again re-initializes it. Treat it as one
 /// process-wide resource rather than many independent objects.
+///
+/// The native shim keeps that instance in unsynchronized global state, so the
+/// CDM must be driven from a single thread. `CdmHost` is therefore neither
+/// `Send` nor `Sync`; keep it on the thread that opened it, and do not open
+/// CDMs on more than one thread.
 pub struct CdmHost {
-    _priv: (),
+    _not_sync: PhantomData<*mut ()>,
 }
 
 impl CdmHost {
@@ -60,7 +66,9 @@ impl CdmHost {
             .ok_or_else(|| anyhow::anyhow!("non-UTF-8 CDM path: {}", path.display()))?;
         let c = CString::new(s)?;
         match unsafe { ch_open(c.as_ptr()) } {
-            0 => Ok(CdmHost { _priv: () }),
+            0 => Ok(CdmHost {
+                _not_sync: PhantomData,
+            }),
             n => anyhow::bail!("ch_open({}) failed (code {n})", path.display()),
         }
     }
@@ -83,7 +91,8 @@ impl CdmHost {
     pub fn challenge(&self, pssh_box: &[u8]) -> anyhow::Result<Vec<u8>> {
         let mut out = std::ptr::null_mut();
         let mut len = 0u32;
-        match unsafe { ch_challenge(pssh_box.as_ptr(), pssh_box.len() as u32, &mut out, &mut len) } {
+        match unsafe { ch_challenge(pssh_box.as_ptr(), pssh_box.len() as u32, &mut out, &mut len) }
+        {
             0 => Ok(unsafe { take(out, len) }),
             n => anyhow::bail!("ch_challenge failed (code {n})"),
         }
