@@ -14,6 +14,7 @@ use std::ffi::CString;
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod error;
 pub mod vendor;
@@ -37,6 +38,7 @@ extern "C" {
         out_len: *mut u32,
     ) -> c_int;
     fn ch_free(p: *mut u8);
+    fn ch_close();
 }
 
 /// Copy a shim-allocated buffer into a `Vec` and free it.
@@ -60,15 +62,24 @@ unsafe fn take(out: *mut u8, len: u32) -> Vec<u8> {
 ///
 /// The underlying native CDM is a single global instance, so every `CdmHost`
 /// drives the same CDM; opening again re-initializes it. Treat it as one
-/// process-wide resource rather than many independent objects.
+/// process-wide resource rather than many independent objects. Dropping the
+/// most recently opened `CdmHost` destroys the CDM and unloads its library;
+/// dropping an older one is a no-op.
 ///
 /// The native shim keeps that instance in unsynchronized global state, so the
 /// CDM must be driven from a single thread. `CdmHost` is therefore neither
 /// `Send` nor `Sync`; keep it on the thread that opened it, and do not open
 /// CDMs on more than one thread.
 pub struct CdmHost {
+    /// Which `open` produced this handle, so dropping a stale one does not
+    /// close the CDM a later `open` installed.
+    generation: u64,
     _not_sync: PhantomData<*mut ()>,
 }
+
+/// Bumped by every `open`; the live CDM belongs to the handle holding the
+/// current value.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 impl CdmHost {
     /// Load + initialize the CDM at `so_path` (e.g. Brave's `libwidevinecdm.so`).
@@ -79,8 +90,10 @@ impl CdmHost {
             .to_str()
             .ok_or_else(|| Error::NonUtf8Path(path.to_path_buf()))?;
         let c = CString::new(s).map_err(|_| Error::NulInPath(path.to_path_buf()))?;
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
         match unsafe { ch_open(c.as_ptr()) } {
             0 => Ok(CdmHost {
+                generation,
                 _not_sync: PhantomData,
             }),
             n => Err(Error::from_open(n, path.to_path_buf())),
@@ -152,6 +165,14 @@ impl CdmHost {
         } {
             0 => Ok(unsafe { take(out, len) }),
             n => Err(Error::from_decrypt(n)),
+        }
+    }
+}
+
+impl Drop for CdmHost {
+    fn drop(&mut self) {
+        if GENERATION.load(Ordering::Relaxed) == self.generation {
+            unsafe { ch_close() };
         }
     }
 }

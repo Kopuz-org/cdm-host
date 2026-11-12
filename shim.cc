@@ -10,6 +10,7 @@
 //                                             → returns the license challenge
 //   ch_update(license,len)                 -> UpdateSession (feed the license)
 //   ch_decrypt(...)                        -> Decrypt one CENC buffer
+//   ch_close()                             -> destroy the CDM + unload it
 //
 // No keys are extracted: the CDM keeps its device key sealed and does the
 // challenge/decrypt internally. We only drive it through its public ABI.
@@ -99,36 +100,66 @@ class Host : public Host_11 {
 };
 
 Host* g_host = nullptr;
+void* g_lib = nullptr;
+bool g_module_initialized = false;
 
 void* GetHost(int version, void* /*user_data*/) {
   if (version == Host_11::kVersion) return static_cast<Host_11*>(g_host);
   return nullptr;
 }
 
+// Tear down whatever ch_open set up, in reverse order. Safe to call on any
+// partial state and more than once.
+void close_cdm() {
+  if (g_host) {
+    if (g_host->cdm) g_host->cdm->Destroy();
+    g_host->cdm = nullptr;
+    delete g_host;
+    g_host = nullptr;
+  }
+  if (g_lib) {
+    if (g_module_initialized) {
+      auto deinit = reinterpret_cast<void (*)()>(dlsym(g_lib, "DeinitializeCdmModule"));
+      if (deinit) deinit();
+    }
+    dlclose(g_lib);
+    g_lib = nullptr;
+  }
+  g_module_initialized = false;
+}
+
 }  // namespace
 
 extern "C" {
 
-// 0 = success
+// 0 = success. Closes any CDM opened before, so re-opening does not leak; on
+// failure nothing is left open.
 int ch_open(const char* so_path) {
-  void* lib = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
-  if (!lib) return 1;
-  auto init = reinterpret_cast<void (*)()>(dlsym(lib, "InitializeCdmModule_4"));
+  close_cdm();
+  g_lib = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
+  if (!g_lib) return 1;
+  auto init = reinterpret_cast<void (*)()>(dlsym(g_lib, "InitializeCdmModule_4"));
   auto create = reinterpret_cast<void* (*)(int, const char*, uint32_t, GetCdmHostFunc, void*)>(
-      dlsym(lib, "CreateCdmInstance"));
-  if (!init || !create) return 2;
+      dlsym(g_lib, "CreateCdmInstance"));
+  if (!init || !create) { close_cdm(); return 2; }
   init();
+  g_module_initialized = true;
   g_host = new Host();
   const char* ks = "com.widevine.alpha";
   void* inst = create(11, ks, static_cast<uint32_t>(strlen(ks)), GetHost, nullptr);
-  if (!inst) return 3;
+  if (!inst) { close_cdm(); return 3; }
   g_host->cdm = static_cast<ContentDecryptionModule_11*>(inst);
   g_host->cdm->Initialize(/*allow_distinctive_identifier=*/false,
                           /*allow_persistent_state=*/false,
                           /*use_hw_secure_codecs=*/false);
   for (int i = 0; i < 200 && !g_host->initialized; ++i) g_host->fire_timers();
-  return g_host->initialized && g_host->init_ok ? 0 : 4;
+  if (g_host->initialized && g_host->init_ok) return 0;
+  close_cdm();
+  return 4;
 }
+
+// Destroy the CDM instance and unload the library. A no-op when nothing is open.
+void ch_close() { close_cdm(); }
 
 // init_data = the CENC pssh box. Returns the license challenge in *out (malloc'd).
 int ch_challenge(const uint8_t* init_data, uint32_t len, uint8_t** out, uint32_t* out_len) {
