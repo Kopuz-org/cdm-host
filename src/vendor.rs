@@ -10,11 +10,37 @@ use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
 
+/// The CDM library's file name on this OS.
+#[cfg(target_os = "macos")]
+const SO_NAME: &str = "libwidevinecdm.dylib";
+#[cfg(not(target_os = "macos"))]
 const SO_NAME: &str = "libwidevinecdm.so";
 
-/// Ensure `dir/libwidevinecdm.so` exists and return its path, installing one if
-/// the directory doesn't already have it. A leading `~` in `dir` is expanded to
-/// `$HOME`.
+/// The `_platform_specific/<dir>` Chromium installs this OS/arch's CDM under,
+/// or `None` where it ships no CDM.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PLATFORM_DIR: Option<&str> = Some("linux_x64");
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const PLATFORM_DIR: Option<&str> = Some("linux_arm64");
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const PLATFORM_DIR: Option<&str> = Some("mac_x64");
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PLATFORM_DIR: Option<&str> = Some("mac_arm64");
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+)))]
+const PLATFORM_DIR: Option<&str> = None;
+
+/// Ensure the CDM library (`libwidevinecdm.so`, `.dylib` on macOS) exists in
+/// `dir` and return its path, installing one if the directory doesn't already
+/// have it. A leading `~` in `dir` is expanded to `$HOME`.
 pub fn ensure(dir: &Path) -> Result<PathBuf> {
     let dir = &expand_tilde(dir);
     let target = dir.join(SO_NAME);
@@ -74,6 +100,7 @@ pub fn locate_system_cdm() -> Option<PathBuf> {
         }
     }
     let home = std::env::var("HOME").unwrap_or_default();
+    #[cfg(not(target_os = "macos"))]
     let roots = [
         format!("{home}/.config/BraveSoftware/Brave-Browser/WidevineCdm"),
         format!("{home}/.config/google-chrome/WidevineCdm"),
@@ -82,21 +109,42 @@ pub fn locate_system_cdm() -> Option<PathBuf> {
         format!("{home}/.config/discord/WidevineCdm"),
         "/opt/google/chrome/WidevineCdm".to_string(),
     ];
+    #[cfg(target_os = "macos")]
+    let roots = [
+        format!("{home}/Library/Application Support/BraveSoftware/Brave-Browser/WidevineCdm"),
+        format!("{home}/Library/Application Support/Google/Chrome/WidevineCdm"),
+        format!("{home}/Library/Application Support/Chromium/WidevineCdm"),
+    ];
     roots.iter().find_map(|r| newest_in_root(Path::new(r)))
 }
 
 /// Within a `WidevineCdm` root (holding `<version>/_platform_specific/...`
-/// subdirs), return the `.so` from the highest version present.
+/// subdirs), return this platform's CDM from the highest version present.
 fn newest_in_root(root: &Path) -> Option<PathBuf> {
+    let platform = PLATFORM_DIR?;
     let mut versions: Vec<PathBuf> = std::fs::read_dir(root)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .collect();
-    versions.sort();
+    sort_versions(&mut versions);
     versions.into_iter().rev().find_map(|v| {
-        let so = v.join("_platform_specific/linux_x64").join(SO_NAME);
+        let so = v.join("_platform_specific").join(platform).join(SO_NAME);
         so.exists().then_some(so)
     })
+}
+
+/// Sort version directories ascending by their dotted numeric name, so
+/// `4.10.x` ranks above `4.9.x`. Names that are not all-numeric sort first.
+fn sort_versions(versions: &mut [PathBuf]) {
+    versions.sort_by_cached_key(|p| (version_key(p), p.clone()));
+}
+
+fn version_key(path: &Path) -> Option<Vec<u64>> {
+    path.file_name()?
+        .to_str()?
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect()
 }
 
 /// Download + extract `libwidevinecdm.so` from the official Google Chrome `.deb`
@@ -104,6 +152,12 @@ fn newest_in_root(root: &Path) -> Option<PathBuf> {
 /// the component endpoint is signature-gated). Writes it to `target`.
 #[cfg(feature = "download")]
 fn download_into(target: &Path) -> Result<()> {
+    // Google publishes the package for x86_64 Linux only.
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err(Error::Package(
+            "the Chrome package only carries an x86_64 Linux CDM".into(),
+        ));
+    }
     const DEB_URL: &str =
         "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb";
 
