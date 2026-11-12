@@ -16,7 +16,9 @@ fn main() -> anyhow::Result<()> {
         .map(std::path::PathBuf::from)
         .or_else(vendor::locate_system_cdm)
         .ok_or_else(|| anyhow::anyhow!("no CDM path given and none found on the system"))?;
-    let pssh_path = std::env::args().nth(2).unwrap_or_else(|| "/tmp/pssh.bin".to_string());
+    let pssh_path = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "/tmp/pssh.bin".to_string());
     let pssh = std::fs::read(&pssh_path)?;
     println!("CDM: {}\npssh box: {} bytes", so.display(), pssh.len());
 
@@ -29,6 +31,9 @@ fn main() -> anyhow::Result<()> {
     // quick sanity: a Widevine SignedMessage starts with field 1 (type) varint.
     let looks_chromecdm = challenge.windows(9).any(|w| w == b"ChromeCDM");
     println!("  contains \"ChromeCDM\": {looks_chromecdm}");
-    println!("  base64: {}", base64::engine::general_purpose::STANDARD.encode(&challenge));
+    println!(
+        "  base64: {}",
+        base64::engine::general_purpose::STANDARD.encode(&challenge)
+    );
     Ok(())
 }

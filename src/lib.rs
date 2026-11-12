@@ -15,7 +15,10 @@ use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
 use std::path::Path;
 
+mod error;
 pub mod vendor;
+
+pub use error::{DecryptStatus, Error, Result};
 
 extern "C" {
     fn ch_open(so_path: *const c_char) -> c_int;
@@ -70,17 +73,17 @@ pub struct CdmHost {
 impl CdmHost {
     /// Load + initialize the CDM at `so_path` (e.g. Brave's `libwidevinecdm.so`).
     /// The path is supplied by the caller — nothing is downloaded or copied.
-    pub fn open(so_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    pub fn open(so_path: impl AsRef<Path>) -> Result<Self> {
         let path = so_path.as_ref();
         let s = path
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 CDM path: {}", path.display()))?;
-        let c = CString::new(s)?;
+            .ok_or_else(|| Error::NonUtf8Path(path.to_path_buf()))?;
+        let c = CString::new(s).map_err(|_| Error::NulInPath(path.to_path_buf()))?;
         match unsafe { ch_open(c.as_ptr()) } {
             0 => Ok(CdmHost {
                 _not_sync: PhantomData,
             }),
-            n => anyhow::bail!("ch_open({}) failed (code {n})", path.display()),
+            n => Err(Error::from_open(n, path.to_path_buf())),
         }
     }
 
@@ -92,28 +95,28 @@ impl CdmHost {
     /// `download` feature enabled — fetched from the official Google Chrome
     /// package. Lets a host app be self-contained without you redistributing the
     /// proprietary CDM binary.
-    pub fn install_or_open(dir: impl AsRef<Path>) -> anyhow::Result<Self> {
+    pub fn install_or_open(dir: impl AsRef<Path>) -> Result<Self> {
         let so = vendor::ensure(dir.as_ref())?;
         Self::open(so)
     }
 
     /// Generate a license challenge from a CENC `pssh` box. This is a real
     /// ChromeCDM challenge — the device Widevine services accept.
-    pub fn challenge(&self, pssh_box: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub fn challenge(&self, pssh_box: &[u8]) -> Result<Vec<u8>> {
         let mut out = std::ptr::null_mut();
         let mut len = 0u32;
         match unsafe { ch_challenge(pssh_box.as_ptr(), pssh_box.len() as u32, &mut out, &mut len) }
         {
             0 => Ok(unsafe { take(out, len) }),
-            n => anyhow::bail!("ch_challenge failed (code {n})"),
+            n => Err(Error::from_challenge(n)),
         }
     }
 
     /// Feed the license response back into the CDM (so it learns the content keys).
-    pub fn update(&self, license: &[u8]) -> anyhow::Result<()> {
+    pub fn update(&self, license: &[u8]) -> Result<()> {
         match unsafe { ch_update(license.as_ptr(), license.len() as u32) } {
             0 => Ok(()),
-            n => anyhow::bail!("ch_update failed (code {n})"),
+            n => Err(Error::from_update(n)),
         }
     }
 
@@ -125,7 +128,7 @@ impl CdmHost {
         key_id: &[u8],
         iv: &[u8],
         subsamples: &[(u32, u32)],
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> Result<Vec<u8>> {
         let mut subs: Vec<u32> = Vec::with_capacity(subsamples.len() * 2);
         for &(c, e) in subsamples {
             subs.push(c);
@@ -148,7 +151,7 @@ impl CdmHost {
             )
         } {
             0 => Ok(unsafe { take(out, len) }),
-            n => anyhow::bail!("ch_decrypt failed (code {n})"),
+            n => Err(Error::from_decrypt(n)),
         }
     }
 }

@@ -8,24 +8,26 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::{Error, Result};
+
 const SO_NAME: &str = "libwidevinecdm.so";
 
 /// Ensure `dir/libwidevinecdm.so` exists and return its path, installing one if
 /// the directory doesn't already have it. A leading `~` in `dir` is expanded to
 /// `$HOME`.
-pub fn ensure(dir: &Path) -> anyhow::Result<PathBuf> {
+pub fn ensure(dir: &Path) -> Result<PathBuf> {
     let dir = &expand_tilde(dir);
     let target = dir.join(SO_NAME);
     if target.exists() {
         return Ok(target);
     }
     std::fs::create_dir_all(dir)
-        .map_err(|e| anyhow::anyhow!("create CDM dir {}: {e}", dir.display()))?;
+        .map_err(|e| Error::io(format!("create CDM dir {}", dir.display()), e))?;
 
     // 1) copy from a CDM already installed by a Chromium-family app.
     if let Some(src) = locate_system_cdm() {
         std::fs::copy(&src, &target)
-            .map_err(|e| anyhow::anyhow!("copy CDM from {}: {e}", src.display()))?;
+            .map_err(|e| Error::io(format!("copy CDM from {}", src.display()), e))?;
         return Ok(target);
     }
 
@@ -36,10 +38,7 @@ pub fn ensure(dir: &Path) -> anyhow::Result<PathBuf> {
         Ok(target)
     }
     #[cfg(not(feature = "download"))]
-    Err(anyhow::anyhow!(
-        "no Widevine CDM found on the system and the `download` feature is off — \
-         install Chrome/Brave/Chromium, point at a CDM with $WIDEVINE_CDM, or enable `download`"
-    ))
+    Err(Error::NoCdmFound)
 }
 
 /// Expand a leading `~` (alone or as `~/...`) to `$HOME`. `~user` forms and
@@ -104,7 +103,7 @@ fn newest_in_root(root: &Path) -> Option<PathBuf> {
 /// (the only stable public source now that the standalone CDM zips are gone and
 /// the component endpoint is signature-gated). Writes it to `target`.
 #[cfg(feature = "download")]
-fn download_into(target: &Path) -> anyhow::Result<()> {
+fn download_into(target: &Path) -> Result<()> {
     const DEB_URL: &str =
         "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb";
 
@@ -113,34 +112,41 @@ fn download_into(target: &Path) -> anyhow::Result<()> {
     std::io::Read::read_to_end(
         &mut ureq::get(DEB_URL)
             .call()
-            .map_err(|e| anyhow::anyhow!("download chrome: {e}"))?
+            .map_err(|e| Error::Download {
+                context: "download the Chrome package",
+                source: e.into(),
+            })?
             .into_reader(),
         &mut deb,
     )
-    .map_err(|e| anyhow::anyhow!("read chrome .deb: {e}"))?;
+    .map_err(|e| Error::io("read the Chrome package", e))?;
 
     // A .deb is an `ar` archive; pull out the `data.tar.{xz,zst,gz}` member.
     let data = ar_member(&deb, "data.tar")
-        .ok_or_else(|| anyhow::anyhow!("no data.tar member in chrome .deb"))?;
+        .ok_or_else(|| Error::Package("no data.tar member in the .deb".into()))?;
     let tar_bytes = decompress(data)?;
 
     // Find WidevineCdm/.../linux_x64/libwidevinecdm.so inside the tarball.
     let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
     for entry in archive
         .entries()
-        .map_err(|e| anyhow::anyhow!("read data.tar: {e}"))?
+        .map_err(|e| Error::io("read data.tar", e))?
     {
-        let mut entry = entry.map_err(|e| anyhow::anyhow!("tar entry: {e}"))?;
-        let path = entry.path().map_err(|e| anyhow::anyhow!("tar path: {e}"))?;
+        let mut entry = entry.map_err(|e| Error::io("read a data.tar entry", e))?;
+        let path = entry
+            .path()
+            .map_err(|e| Error::io("read a data.tar entry path", e))?;
         let p = path.to_string_lossy();
         if p.contains("WidevineCdm") && p.ends_with("linux_x64/libwidevinecdm.so") {
             let mut out = std::fs::File::create(target)
-                .map_err(|e| anyhow::anyhow!("create {}: {e}", target.display()))?;
-            std::io::copy(&mut entry, &mut out).map_err(|e| anyhow::anyhow!("extract CDM: {e}"))?;
+                .map_err(|e| Error::io(format!("create {}", target.display()), e))?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| Error::io("extract the CDM", e))?;
             return Ok(());
         }
     }
-    anyhow::bail!("libwidevinecdm.so not found inside the chrome .deb")
+    Err(Error::Package(
+        "no libwidevinecdm.so inside the .deb".into(),
+    ))
 }
 
 /// Return the contents of the first `ar` member whose name starts with `prefix`.
@@ -171,23 +177,34 @@ fn ar_member<'a>(ar: &'a [u8], prefix: &str) -> Option<&'a [u8]> {
 
 /// Decompress a `data.tar.{xz,zst,gz}` member by sniffing its magic bytes.
 #[cfg(feature = "download")]
-fn decompress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     match data {
         [0xFD, b'7', b'z', b'X', b'Z', 0x00, ..] => {
-            lzma_rs::xz_decompress(&mut std::io::Cursor::new(data), &mut out)
-                .map_err(|e| anyhow::anyhow!("xz decompress: {e}"))?;
+            lzma_rs::xz_decompress(&mut std::io::Cursor::new(data), &mut out).map_err(|e| {
+                Error::Download {
+                    context: "xz-decompress data.tar",
+                    source: e.into(),
+                }
+            })?;
         }
         [0x28, 0xB5, 0x2F, 0xFD, ..] => {
-            let mut dec = ruzstd::StreamingDecoder::new(std::io::Cursor::new(data))
-                .map_err(|e| anyhow::anyhow!("zstd init: {e}"))?;
+            let mut dec =
+                ruzstd::StreamingDecoder::new(std::io::Cursor::new(data)).map_err(|e| {
+                    Error::Download {
+                        context: "start zstd-decompressing data.tar",
+                        source: e.into(),
+                    }
+                })?;
             std::io::Read::read_to_end(&mut dec, &mut out)
-                .map_err(|e| anyhow::anyhow!("zstd decompress: {e}"))?;
+                .map_err(|e| Error::io("zstd-decompress data.tar", e))?;
         }
-        _ => anyhow::bail!(
-            "unsupported data.tar compression (magic {:02x?})",
-            &data[..data.len().min(4)]
-        ),
+        _ => {
+            return Err(Error::Package(format!(
+                "unsupported data.tar compression (magic {:02x?})",
+                &data[..data.len().min(4)]
+            )))
+        }
     }
     Ok(out)
 }

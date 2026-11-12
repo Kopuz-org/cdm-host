@@ -25,6 +25,7 @@ cc = "1"
 
 [dependencies]
 anyhow = "1"
+thiserror = "2"
 base64 = "0.22"
 
 # Optional, only for the `download` fallback in `vendor` (pure-Rust extraction).
