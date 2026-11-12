@@ -178,3 +178,22 @@ impl Drop for CdmHost {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_missing_library_fails_to_load() {
+        let path = Path::new("/nonexistent/libwidevinecdm.so");
+        assert!(matches!(CdmHost::open(path), Err(Error::Load(p)) if p == path));
+    }
+
+    #[test]
+    fn open_rejects_nul_in_path() {
+        assert!(matches!(
+            CdmHost::open("/tmp/a\0b"),
+            Err(Error::NulInPath(_))
+        ));
+    }
+}

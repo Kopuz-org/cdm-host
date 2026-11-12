@@ -262,3 +262,119 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home() -> Option<PathBuf> {
+        Some(PathBuf::from("/home/u"))
+    }
+
+    #[test]
+    fn tilde_alone_is_home() {
+        assert_eq!(
+            expand_tilde_with(Path::new("~"), home()),
+            Path::new("/home/u")
+        );
+    }
+
+    #[test]
+    fn tilde_slash_joins_home() {
+        assert_eq!(
+            expand_tilde_with(Path::new("~/.local/share/cdm"), home()),
+            Path::new("/home/u/.local/share/cdm")
+        );
+    }
+
+    #[test]
+    fn other_paths_are_unchanged() {
+        for p in ["~user/cdm", "/opt/~/cdm", "cdm/~", "./~"] {
+            assert_eq!(expand_tilde_with(Path::new(p), home()), Path::new(p));
+        }
+    }
+
+    #[test]
+    fn tilde_without_home_is_unchanged() {
+        assert_eq!(
+            expand_tilde_with(Path::new("~/cdm"), None),
+            Path::new("~/cdm")
+        );
+    }
+
+    #[test]
+    fn versions_sort_numerically() {
+        let mut v: Vec<PathBuf> = ["4.10.2830.0", "4.9.0.0", "4.10.1679.0", "10.0.0.0"]
+            .iter()
+            .map(|n| Path::new("/root").join(n))
+            .collect();
+        sort_versions(&mut v);
+        let names: Vec<_> = v.iter().map(|p| p.file_name().unwrap()).collect();
+        assert_eq!(names, ["4.9.0.0", "4.10.1679.0", "4.10.2830.0", "10.0.0.0"]);
+    }
+
+    #[test]
+    fn non_version_dirs_sort_first() {
+        let mut v = vec![PathBuf::from("/r/4.10.0.0"), PathBuf::from("/r/latest")];
+        sort_versions(&mut v);
+        assert_eq!(
+            v,
+            [PathBuf::from("/r/latest"), PathBuf::from("/r/4.10.0.0")]
+        );
+        assert_eq!(version_key(Path::new("/r/4.x.0")), None);
+        assert_eq!(version_key(Path::new("/r/4.10.2")), Some(vec![4, 10, 2]));
+    }
+
+    #[test]
+    fn newest_in_missing_root_is_none() {
+        assert_eq!(newest_in_root(Path::new("/nonexistent/WidevineCdm")), None);
+    }
+
+    /// Build a GNU `ar` archive from `(name, contents)` members.
+    #[cfg(feature = "download")]
+    fn ar(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        for (name, data) in members {
+            let header = format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                format!("{name}/"),
+                0,
+                0,
+                0,
+                100644,
+                data.len()
+            );
+            assert_eq!(header.len(), 60);
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                out.push(b'\n');
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn ar_member_finds_by_prefix_past_odd_padding() {
+        let deb = ar(&[
+            ("debian-binary", b"2.0\n"),
+            ("control.tar.xz", b"odd"),
+            ("data.tar.xz", b"payload"),
+        ]);
+        assert_eq!(ar_member(&deb, "data.tar"), Some(&b"payload"[..]));
+        assert_eq!(ar_member(&deb, "control.tar"), Some(&b"odd"[..]));
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn ar_member_rejects_bad_input() {
+        let deb = ar(&[("debian-binary", b"2.0\n")]);
+        assert_eq!(ar_member(&deb, "data.tar"), None);
+        assert_eq!(ar_member(b"not an archive", "data.tar"), None);
+
+        let mut truncated = ar(&[("data.tar.xz", b"payload")]);
+        truncated.truncate(truncated.len() - 2);
+        assert_eq!(ar_member(&truncated, "data.tar"), None);
+    }
+}
