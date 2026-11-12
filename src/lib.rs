@@ -36,7 +36,18 @@ extern "C" {
     fn ch_free(p: *mut u8);
 }
 
+/// Copy a shim-allocated buffer into a `Vec` and free it.
+///
+/// The shim hands back `malloc(0)` for an empty result, which may be null, and
+/// `from_raw_parts` requires a non-null pointer even for length 0.
+///
+/// # Safety
+/// `out` must be null or a `len`-byte buffer allocated by the shim that is not
+/// used again after this call.
 unsafe fn take(out: *mut u8, len: u32) -> Vec<u8> {
+    if out.is_null() {
+        return Vec::new();
+    }
     let v = std::slice::from_raw_parts(out, len as usize).to_vec();
     ch_free(out);
     v
