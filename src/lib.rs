@@ -11,10 +11,15 @@
 //!   `download` feature — fetching it from Google), then open it.
 
 use std::ffi::CString;
+use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+mod error;
 pub mod vendor;
+
+pub use error::{DecryptStatus, Error, KeyStatus, Result};
 
 extern "C" {
     fn ch_open(so_path: *const c_char) -> c_int;
@@ -33,9 +38,21 @@ extern "C" {
         out_len: *mut u32,
     ) -> c_int;
     fn ch_free(p: *mut u8);
+    fn ch_close();
 }
 
+/// Copy a shim-allocated buffer into a `Vec` and free it.
+///
+/// The shim hands back `malloc(0)` for an empty result, which may be null, and
+/// `from_raw_parts` requires a non-null pointer even for length 0.
+///
+/// # Safety
+/// `out` must be null or a `len`-byte buffer allocated by the shim that is not
+/// used again after this call.
 unsafe fn take(out: *mut u8, len: u32) -> Vec<u8> {
+    if out.is_null() {
+        return Vec::new();
+    }
     let v = std::slice::from_raw_parts(out, len as usize).to_vec();
     ch_free(out);
     v
@@ -45,23 +62,41 @@ unsafe fn take(out: *mut u8, len: u32) -> Vec<u8> {
 ///
 /// The underlying native CDM is a single global instance, so every `CdmHost`
 /// drives the same CDM; opening again re-initializes it. Treat it as one
-/// process-wide resource rather than many independent objects.
+/// process-wide resource rather than many independent objects. Dropping the
+/// most recently opened `CdmHost` destroys the CDM and unloads its library;
+/// dropping an older one is a no-op.
+///
+/// The native shim keeps that instance in unsynchronized global state, so the
+/// CDM must be driven from a single thread. `CdmHost` is therefore neither
+/// `Send` nor `Sync`; keep it on the thread that opened it, and do not open
+/// CDMs on more than one thread.
 pub struct CdmHost {
-    _priv: (),
+    /// Which `open` produced this handle, so dropping a stale one does not
+    /// close the CDM a later `open` installed.
+    generation: u64,
+    _not_sync: PhantomData<*mut ()>,
 }
+
+/// Bumped by every `open`; the live CDM belongs to the handle holding the
+/// current value.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 impl CdmHost {
     /// Load + initialize the CDM at `so_path` (e.g. Brave's `libwidevinecdm.so`).
     /// The path is supplied by the caller — nothing is downloaded or copied.
-    pub fn open(so_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    pub fn open(so_path: impl AsRef<Path>) -> Result<Self> {
         let path = so_path.as_ref();
         let s = path
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 CDM path: {}", path.display()))?;
-        let c = CString::new(s)?;
+            .ok_or_else(|| Error::NonUtf8Path(path.to_path_buf()))?;
+        let c = CString::new(s).map_err(|_| Error::NulInPath(path.to_path_buf()))?;
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
         match unsafe { ch_open(c.as_ptr()) } {
-            0 => Ok(CdmHost { _priv: () }),
-            n => anyhow::bail!("ch_open({}) failed (code {n})", path.display()),
+            0 => Ok(CdmHost {
+                generation,
+                _not_sync: PhantomData,
+            }),
+            n => Err(Error::from_open(n, path.to_path_buf())),
         }
     }
 
@@ -73,27 +108,30 @@ impl CdmHost {
     /// `download` feature enabled — fetched from the official Google Chrome
     /// package. Lets a host app be self-contained without you redistributing the
     /// proprietary CDM binary.
-    pub fn install_or_open(dir: impl AsRef<Path>) -> anyhow::Result<Self> {
+    pub fn install_or_open(dir: impl AsRef<Path>) -> Result<Self> {
         let so = vendor::ensure(dir.as_ref())?;
         Self::open(so)
     }
 
     /// Generate a license challenge from a CENC `pssh` box. This is a real
     /// ChromeCDM challenge — the device Widevine services accept.
-    pub fn challenge(&self, pssh_box: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub fn challenge(&self, pssh_box: &[u8]) -> Result<Vec<u8>> {
         let mut out = std::ptr::null_mut();
         let mut len = 0u32;
-        match unsafe { ch_challenge(pssh_box.as_ptr(), pssh_box.len() as u32, &mut out, &mut len) } {
+        match unsafe { ch_challenge(pssh_box.as_ptr(), pssh_box.len() as u32, &mut out, &mut len) }
+        {
             0 => Ok(unsafe { take(out, len) }),
-            n => anyhow::bail!("ch_challenge failed (code {n})"),
+            n => Err(Error::from_challenge(n)),
         }
     }
 
     /// Feed the license response back into the CDM (so it learns the content keys).
-    pub fn update(&self, license: &[u8]) -> anyhow::Result<()> {
+    /// Succeeds only once at least one key is usable; otherwise the error names
+    /// the status the CDM reported.
+    pub fn update(&self, license: &[u8]) -> Result<()> {
         match unsafe { ch_update(license.as_ptr(), license.len() as u32) } {
             0 => Ok(()),
-            n => anyhow::bail!("ch_update failed (code {n})"),
+            n => Err(Error::from_update(n)),
         }
     }
 
@@ -105,7 +143,7 @@ impl CdmHost {
         key_id: &[u8],
         iv: &[u8],
         subsamples: &[(u32, u32)],
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> Result<Vec<u8>> {
         let mut subs: Vec<u32> = Vec::with_capacity(subsamples.len() * 2);
         for &(c, e) in subsamples {
             subs.push(c);
@@ -128,7 +166,34 @@ impl CdmHost {
             )
         } {
             0 => Ok(unsafe { take(out, len) }),
-            n => anyhow::bail!("ch_decrypt failed (code {n})"),
+            n => Err(Error::from_decrypt(n)),
         }
+    }
+}
+
+impl Drop for CdmHost {
+    fn drop(&mut self) {
+        if GENERATION.load(Ordering::Relaxed) == self.generation {
+            unsafe { ch_close() };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_missing_library_fails_to_load() {
+        let path = Path::new("/nonexistent/libwidevinecdm.so");
+        assert!(matches!(CdmHost::open(path), Err(Error::Load(p)) if p == path));
+    }
+
+    #[test]
+    fn open_rejects_nul_in_path() {
+        assert!(matches!(
+            CdmHost::open("/tmp/a\0b"),
+            Err(Error::NulInPath(_))
+        ));
     }
 }
